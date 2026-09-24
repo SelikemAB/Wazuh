@@ -1,0 +1,24 @@
+{
+  "id": "1727200000.424242",
+  "timestamp": "2026-09-24T12:00:00.000+0000",
+  "location": "EventChannel",
+  "agent": { "id": "001", "name": "test-endpoint", "ip": "10.0.0.5" },
+  "manager": { "name": "wazuh.manager" },
+  "rule": {
+    "id": "92052",
+    "level": 10,
+    "description": "TEST - integration smoke test (safe to close)",
+    "groups": ["windows", "sysmon", "sysmon_event1"],
+    "mitre": { "id": ["T1059"] }
+  },
+  "data": {
+    "srcip": "8.8.8.8",
+    "win": {
+      "eventdata": {
+        "image": "C:\\Users\\Public\\test.exe",
+        "hashes": "SHA1=3395856CE81F2B7382DEE72602F798B642F14140,MD5=44D88612FEA8A8F36DE82E1278ABB02F,SHA256=275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F"
+      }
+    }
+  },
+  "full_log": "integration smoke test"
+}

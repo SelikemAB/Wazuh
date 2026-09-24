@@ -1,0 +1,200 @@
+# Optional CTI / SOAR stack: MISP + TheHive 5 + Cortex 3.
+#
+# Overlay on top of docker-compose.yml so everything shares one network and
+# the Wazuh manager can reach `misp-core` and `thehive` by service name:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.soar.yml up -d
+#   (the scripts do this automatically when ENABLE_SOAR_STACK=true)
+#
+# Sizing: this adds ~8 GB RAM on top of Wazuh. Pin image tags before production.
+# See docs/04-integrations-misp-thehive-cortex.md for the wiring steps.
+
+x-soar-logging: &soar-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  # ------------------------------------------------------------------ MISP
+  misp-db:
+    image: mariadb:10.11
+    restart: always
+    logging: *soar-logging
+    environment:
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MISP_DB_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MISP_DB_ROOT_PASSWORD}
+      - MYSQL_DATABASE=misp
+    command: "--innodb-buffer-pool-size=1024M --innodb-log-file-size=256M"
+    volumes:
+      - misp_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  misp-redis:
+    image: valkey/valkey:7.2
+    restart: always
+    logging: *soar-logging
+    command: ["valkey-server", "--requirepass", "${MISP_REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$$REDISCLI_AUTH\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      - REDISCLI_AUTH=${MISP_REDIS_PASSWORD}
+
+  misp-modules:
+    image: ghcr.io/misp/misp-docker/misp-modules:latest
+    restart: always
+    logging: *soar-logging
+    environment:
+      - REDIS_BACKEND=misp-redis
+      - REDIS_PW=${MISP_REDIS_PASSWORD}
+    depends_on:
+      misp-redis:
+        condition: service_healthy
+
+  misp-core:
+    image: ghcr.io/misp/misp-docker/misp-core:latest
+    restart: always
+    logging: *soar-logging
+    ports:
+      - "${MISP_PORT:-8443}:443"
+    environment:
+      - BASE_URL=${MISP_BASE_URL}
+      - ADMIN_EMAIL=${MISP_ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${MISP_ADMIN_PASSWORD}
+      - ADMIN_KEY=${MISP_ADMIN_KEY}
+      - ADMIN_ORG=${MISP_ADMIN_ORG}
+      - MYSQL_HOST=misp-db
+      - MYSQL_PORT=3306
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MISP_DB_PASSWORD}
+      - MYSQL_DATABASE=misp
+      - REDIS_HOST=misp-redis
+      - REDIS_PASSWORD=${MISP_REDIS_PASSWORD}
+      - MISP_MODULES_FQDN=http://misp-modules
+      - ENABLE_DB_SETTINGS=false
+      - DISABLE_IPV6=true
+    volumes:
+      - misp_configs:/var/www/MISP/app/Config
+      - misp_logs:/var/www/MISP/app/tmp/logs
+      - misp_files:/var/www/MISP/app/files
+      - misp_ssl:/etc/nginx/certs
+      - misp_gnupg:/var/www/MISP/.gnupg
+    depends_on:
+      misp-db:
+        condition: service_healthy
+      misp-redis:
+        condition: service_healthy
+      misp-modules:
+        condition: service_started
+
+  # ------------------------------------------- TheHive / Cortex backends
+  soar-cassandra:
+    image: cassandra:4.1
+    restart: always
+    logging: *soar-logging
+    environment:
+      - CASSANDRA_CLUSTER_NAME=TheHive
+      - MAX_HEAP_SIZE=1024M
+      - HEAP_NEWSIZE=256M
+    volumes:
+      - soar_cassandra:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # Internal only (no published port), shared by TheHive and Cortex.
+  soar-elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.25
+    restart: always
+    logging: *soar-logging
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - cluster.name=soar
+      - http.host=0.0.0.0
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - soar_elasticsearch:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # ---------------------------------------------------------------- Cortex
+  cortex:
+    image: thehiveproject/cortex:${CORTEX_VERSION:-3.1.8-1}
+    restart: always
+    logging: *soar-logging
+    ports:
+      - "${CORTEX_PORT:-9001}:9001"
+    command: ["--no-config"]
+    environment:
+      - CORTEX_SECRET=${CORTEX_SECRET}
+      - CORTEX_JOB_DIR=${CORTEX_JOB_DIR:-/tmp/cortex-jobs}
+    volumes:
+      - ./integrations/cortex/application.conf:/etc/cortex/application.conf:ro
+      # Analyzers/responders run as sibling containers. The job directory must
+      # have the same path on the host and in the container.
+      # SECURITY: docker.sock == root on the host. Isolate this VM accordingly.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CORTEX_JOB_DIR:-/tmp/cortex-jobs}:${CORTEX_JOB_DIR:-/tmp/cortex-jobs}
+    depends_on:
+      soar-elasticsearch:
+        condition: service_healthy
+
+  # --------------------------------------------------------------- TheHive
+  thehive:
+    image: strangebee/thehive:${THEHIVE_VERSION:-5.4}
+    restart: always
+    logging: *soar-logging
+    ports:
+      - "${THEHIVE_PORT:-9000}:9000"
+    environment:
+      - JVM_OPTS=-Xms1024M -Xmx1024M
+    command:
+      - --secret
+      - ${THEHIVE_SECRET}
+      - --cql-hostnames
+      - soar-cassandra
+      - --index-backend
+      - elasticsearch
+      - --es-hostnames
+      - soar-elasticsearch
+      # Cortex is attached from the TheHive UI once its API key exists
+      # (Platform management > Connectors > Cortex, URL http://cortex:9001).
+      - --no-config-cortex
+    volumes:
+      - thehive_data:/opt/thp/thehive/files
+    depends_on:
+      soar-cassandra:
+        condition: service_healthy
+      soar-elasticsearch:
+        condition: service_healthy
+      cortex:
+        condition: service_started
+
+volumes:
+  misp_mysql:
+  misp_configs:
+  misp_logs:
+  misp_files:
+  misp_ssl:
+  misp_gnupg:
+  soar_cassandra:
+  soar_elasticsearch:
+  thehive_data:
