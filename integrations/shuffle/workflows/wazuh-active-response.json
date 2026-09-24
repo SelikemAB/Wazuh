@@ -1,0 +1,233 @@
+{
+  "id": "4c3b94c1-19ec-5320-95a2-528fc671209d",
+  "name": "Wazuh - Auto-response (block IP)",
+  "description": "Brute-force / MISP-IP alerts -> allowlist check -> Wazuh active response firewall-drop on the reporting agent.",
+  "is_valid": true,
+  "start": "d05967e0-9fe7-50fd-abb1-276685281a89",
+  "actions": [
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "ar_decide",
+      "id": "d05967e0-9fe7-50fd-abb1-276685281a89",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": true,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"ar_decide\": should we block an IP for this alert?\nALERT = load(r\"\"\"$exec.all_fields\"\"\")\nRULE_IDS = set(csv(cfg(\"$ar_rule_ids\", \"5712,5720,5763\")))\nALLOWLIST = csv(cfg(\"$ar_allowlist\", \"10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8\"))\n\nrule = ALERT.get(\"rule\", {}) or {}\ndata = ALERT.get(\"data\", {}) or {}\nagent = ALERT.get(\"agent\", {}) or {}\nout = {\"proceed\": False, \"rule_id\": rule.get(\"id\"), \"agent_id\": agent.get(\"id\")}\n\nip = data.get(\"srcip\")\nmisp = data.get(\"misp\", {}) or {}\nif not ip and is_ip(misp.get(\"value\", \"\")):\n    ip = misp[\"value\"]\n\nif str(rule.get(\"id\")) not in RULE_IDS:\n    out[\"reason\"] = \"rule not in ar_rule_ids\"\nelif not ip or not is_ip(ip):\n    out[\"reason\"] = \"no source IP in alert\"\nelif any(ipaddress.ip_address(ip) in ipaddress.ip_network(net, strict=False) for net in ALLOWLIST):\n    out[\"reason\"] = \"IP %s is allowlisted\" % ip\nelif not agent.get(\"id\") or agent.get(\"id\") == \"000\":\n    out[\"reason\"] = \"alert did not come from an agent\"\nelse:\n    out.update({\"proceed\": True, \"ip\": ip, \"reason\": \"block %s on agent %s\" % (ip, agent.get(\"id\"))})\nemit(out)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 400,
+        "y": 300
+      }
+    },
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "ar_block",
+      "id": "8c86b889-36cf-5d53-83f0-b49e58f97e37",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": false,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"ar_block\": trigger the Wazuh active response on the agent that saw the attack.\nDECISION = load(r\"\"\"$ar_decide.message\"\"\")\nAPI = cfg(\"$wazuh_api_url\").rstrip(\"/\")\nUSER = cfg(\"$wazuh_api_user\")\nPASSWORD = cfg(\"$wazuh_api_password\")\nCOMMAND = cfg(\"$ar_command\", \"!firewall-drop\")\n\nout = {\"blocked\": False, \"ip\": DECISION.get(\"ip\"), \"agent_id\": DECISION.get(\"agent_id\")}\ntry:\n    r = requests.post(API + \"/security/user/authenticate?raw=true\", auth=(USER, PASSWORD),\n                      verify=False, timeout=20)\n    r.raise_for_status()\n    token = r.text.strip()\n    r = requests.put(API + \"/active-response?agents_list=%s\" % DECISION[\"agent_id\"],\n                     headers={\"Authorization\": \"Bearer \" + token, \"Content-Type\": \"application/json\"},\n                     json={\"command\": COMMAND, \"arguments\": [],\n                           \"alert\": {\"data\": {\"srcip\": DECISION[\"ip\"]}}},\n                     verify=False, timeout=20)\n    res = r.json()\n    out[\"response\"] = res.get(\"message\")\n    out[\"blocked\"] = r.ok and res.get(\"data\", {}).get(\"total_affected_items\", 0) > 0\n    if not out[\"blocked\"]:\n        out[\"error\"] = json.dumps(res.get(\"data\", {}).get(\"failed_items\", res))[:500]\nexcept Exception as exc:\n    out[\"error\"] = str(exc)[:500]\nemit(out)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 720,
+        "y": 300
+      }
+    }
+  ],
+  "branches": [
+    {
+      "id": "1a2aef6c-4585-5b4d-9e41-239ca81c9f8b",
+      "source_id": "2b2fcead-d61b-5348-9c3c-9f7bbbdf164e",
+      "destination_id": "d05967e0-9fe7-50fd-abb1-276685281a89",
+      "conditions": [],
+      "label": "",
+      "has_errors": false
+    },
+    {
+      "id": "a5b6bed4-e9d8-5acc-a92e-4083b56cc1ed",
+      "source_id": "d05967e0-9fe7-50fd-abb1-276685281a89",
+      "destination_id": "8c86b889-36cf-5d53-83f0-b49e58f97e37",
+      "conditions": [
+        {
+          "condition": {
+            "name": "condition",
+            "value": "equals",
+            "id": "e743eddd-8e49-5d85-b685-cda93c71b1b1"
+          },
+          "source": {
+            "name": "source",
+            "value": "$ar_decide.message.proceed",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "3e910934-3ceb-50e1-8bac-9742b1ef0330"
+          },
+          "destination": {
+            "name": "destination",
+            "value": "true",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "bef83746-be33-560e-b818-d46763cdd9dc"
+          }
+        }
+      ],
+      "label": "",
+      "has_errors": false
+    }
+  ],
+  "triggers": [
+    {
+      "app_name": "Webhook",
+      "app_version": "1.0.0",
+      "name": "Webhook",
+      "label": "wazuh_alerts",
+      "description": "Receives Wazuh alerts from the built-in shuffle integration",
+      "id": "2b2fcead-d61b-5348-9c3c-9f7bbbdf164e",
+      "trigger_type": "WEBHOOK",
+      "status": "uninitialized",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "errors": [],
+      "large_image": "",
+      "position": {
+        "x": 100,
+        "y": 300
+      },
+      "parameters": [
+        {
+          "name": "url",
+          "value": "http://shuffle-backend:5001/api/v1/hooks/webhook_2b2fcead-d61b-5348-9c3c-9f7bbbdf164e",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "tmp",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "auth_headers",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "custom_response_body",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "await_response",
+          "value": "v1",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ]
+    }
+  ],
+  "workflow_variables": [
+    {
+      "id": "e62894fe-1bd9-54db-91aa-ac337e092b31",
+      "name": "ar_rule_ids",
+      "value": "5712,5720,5763,5551,60204,31151,100623,100624",
+      "description": ""
+    },
+    {
+      "id": "3cfef89d-b1ca-5c32-b1c6-8656a3e67ec5",
+      "name": "ar_allowlist",
+      "value": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8",
+      "description": ""
+    },
+    {
+      "id": "5a92bf5f-b493-5eb0-8b9e-ce70f65227b3",
+      "name": "wazuh_api_url",
+      "value": "https://SOAR_HOST_ADDRESS:55000",
+      "description": ""
+    },
+    {
+      "id": "ecfd408b-1070-5545-9b4c-d74856035ee9",
+      "name": "wazuh_api_user",
+      "value": "shuffle-ar",
+      "description": ""
+    },
+    {
+      "id": "25ce9f06-2968-57e3-9d74-ca70fdb1d7cb",
+      "name": "wazuh_api_password",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "a482e055-0b2a-5173-b8d4-64efaa9df464",
+      "name": "ar_command",
+      "value": "!firewall-drop",
+      "description": ""
+    }
+  ],
+  "execution_variables": [],
+  "tags": [
+    "wazuh",
+    "boilerplate"
+  ],
+  "errors": [],
+  "sharing": "private",
+  "execution_environment": "Shuffle",
+  "configuration": {
+    "exit_on_error": false,
+    "start_from_top": false
+  }
+}

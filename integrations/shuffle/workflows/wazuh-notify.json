@@ -1,0 +1,257 @@
+{
+  "id": "aa3ba22d-a505-5d55-a412-eacb5f145afe",
+  "name": "Wazuh - Notification",
+  "description": "High-severity Wazuh alerts -> Slack / Microsoft Teams / e-mail summary.",
+  "is_valid": true,
+  "start": "68b37643-2a1a-5e0c-9d55-9b49e52f9560",
+  "actions": [
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "notify_filter",
+      "id": "68b37643-2a1a-5e0c-9d55-9b49e52f9560",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": true,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"notify_filter\": only notify for alerts at or above notify_min_level.\nALERT = load(r\"\"\"$exec.all_fields\"\"\")\nMIN_LEVEL = as_int(cfg(\"$notify_min_level\", \"12\"), 12)\n\nrule = ALERT.get(\"rule\", {}) or {}\nagent = ALERT.get(\"agent\", {}) or {}\nlevel = as_int(rule.get(\"level\"), 0)\nemit({\n    \"proceed\": bool(ALERT) and level >= MIN_LEVEL,\n    \"level\": level,\n    \"title\": \"Wazuh level %s: %s\" % (level, rule.get(\"description\")),\n    \"rule_id\": rule.get(\"id\"),\n    \"agent\": \"%s (%s)\" % (agent.get(\"name\", \"manager\"), agent.get(\"id\", \"000\")),\n    \"timestamp\": ALERT.get(\"timestamp\"),\n    \"alert_id\": ALERT.get(\"id\"),\n    \"groups\": \", \".join(rule.get(\"groups\", []) or []),\n    \"full_log\": str(ALERT.get(\"full_log\", \"\"))[:1500],\n})\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 400,
+        "y": 300
+      }
+    },
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "notify_send",
+      "id": "6eed63a9-6010-50f9-ba50-708e4304e0fa",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": false,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"notify_send\": deliver the summary to Slack, Teams and/or e-mail.\nimport smtplib\nfrom email.message import EmailMessage\n\nN = load(r\"\"\"$notify_filter.message\"\"\")\nSLACK = cfg(\"$slack_webhook_url\")\nTEAMS = cfg(\"$teams_webhook_url\")\nSMTP_HOST = cfg(\"$smtp_host\")\nSMTP_PORT = as_int(cfg(\"$smtp_port\", \"587\"), 587)\nSMTP_USER = cfg(\"$smtp_user\")\nSMTP_PASSWORD = cfg(\"$smtp_password\")\nMAIL_FROM = cfg(\"$mail_from\")\nMAIL_TO = csv(cfg(\"$mail_to\"))\nDASHBOARD = cfg(\"$dashboard_url\")\n\nfacts = [(\"Rule\", str(N.get(\"rule_id\"))), (\"Agent\", N.get(\"agent\")), (\"Time\", N.get(\"timestamp\")),\n         (\"Groups\", N.get(\"groups\")), (\"Alert ID\", str(N.get(\"alert_id\")))]\ntext = \"*%s*\\n%s\\n```%s```%s\" % (\n    N.get(\"title\"), \"\\n\".join(\"%s: %s\" % f for f in facts), N.get(\"full_log\", \"\"),\n    \"\\n\" + DASHBOARD if DASHBOARD else \"\")\nout = {}\n\nif SLACK:\n    r = requests.post(SLACK, json={\"text\": text}, timeout=15)\n    out[\"slack\"] = r.status_code\n\nif TEAMS:  # Teams \"Workflows\" incoming webhook (adaptive card)\n    card = {\"type\": \"AdaptiveCard\", \"version\": \"1.4\",\n            chr(36) + \"schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",\n            \"body\": [{\"type\": \"TextBlock\", \"size\": \"Medium\", \"weight\": \"Bolder\", \"text\": N.get(\"title\"), \"wrap\": True},\n                     {\"type\": \"FactSet\", \"facts\": [{\"title\": k, \"value\": v or \"-\"} for k, v in facts]},\n                     {\"type\": \"TextBlock\", \"text\": N.get(\"full_log\", \"\"), \"wrap\": True, \"fontType\": \"Monospace\"}]}\n    r = requests.post(TEAMS, json={\"type\": \"message\", \"attachments\": [\n        {\"contentType\": \"application/vnd.microsoft.card.adaptive\", \"content\": card}]}, timeout=15)\n    out[\"teams\"] = r.status_code\n\nif SMTP_HOST and MAIL_TO:\n    msg = EmailMessage()\n    msg[\"Subject\"] = \"[Wazuh] \" + str(N.get(\"title\"))\n    msg[\"From\"] = MAIL_FROM or SMTP_USER\n    msg[\"To\"] = \", \".join(MAIL_TO)\n    msg.set_content(text.replace(\"*\", \"\").replace(\"```\", \"\\n\"))\n    try:\n        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:\n            s.starttls()\n            if SMTP_USER:\n                s.login(SMTP_USER, SMTP_PASSWORD)\n            s.send_message(msg)\n        out[\"email\"] = \"sent\"\n    except Exception as exc:\n        out[\"email\"] = \"failed: %s\" % str(exc)[:200]\nemit(out)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 720,
+        "y": 300
+      }
+    }
+  ],
+  "branches": [
+    {
+      "id": "6eebb94f-7c9d-5c41-a9a8-3f91de409be2",
+      "source_id": "bb688f37-4722-5214-9d79-edbc04f6fa5f",
+      "destination_id": "68b37643-2a1a-5e0c-9d55-9b49e52f9560",
+      "conditions": [],
+      "label": "",
+      "has_errors": false
+    },
+    {
+      "id": "b01d5cfc-d09e-5ab4-8fa1-d663e70299f8",
+      "source_id": "68b37643-2a1a-5e0c-9d55-9b49e52f9560",
+      "destination_id": "6eed63a9-6010-50f9-ba50-708e4304e0fa",
+      "conditions": [
+        {
+          "condition": {
+            "name": "condition",
+            "value": "equals",
+            "id": "8778678a-87da-53ad-8c0b-4b01c7b63fa0"
+          },
+          "source": {
+            "name": "source",
+            "value": "$notify_filter.message.proceed",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "adc35ff0-d56a-5c93-9978-4fc31056d32b"
+          },
+          "destination": {
+            "name": "destination",
+            "value": "true",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "d1df5aa9-079e-599e-a944-c8eec5dd2ef7"
+          }
+        }
+      ],
+      "label": "",
+      "has_errors": false
+    }
+  ],
+  "triggers": [
+    {
+      "app_name": "Webhook",
+      "app_version": "1.0.0",
+      "name": "Webhook",
+      "label": "wazuh_alerts",
+      "description": "Receives Wazuh alerts from the built-in shuffle integration",
+      "id": "bb688f37-4722-5214-9d79-edbc04f6fa5f",
+      "trigger_type": "WEBHOOK",
+      "status": "uninitialized",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "errors": [],
+      "large_image": "",
+      "position": {
+        "x": 100,
+        "y": 300
+      },
+      "parameters": [
+        {
+          "name": "url",
+          "value": "http://shuffle-backend:5001/api/v1/hooks/webhook_bb688f37-4722-5214-9d79-edbc04f6fa5f",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "tmp",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "auth_headers",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "custom_response_body",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "await_response",
+          "value": "v1",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ]
+    }
+  ],
+  "workflow_variables": [
+    {
+      "id": "d145bafc-7141-58cd-8f63-ba07ee9d3755",
+      "name": "notify_min_level",
+      "value": "12",
+      "description": ""
+    },
+    {
+      "id": "0020d09e-1a61-553d-b9db-08ffde2a310e",
+      "name": "slack_webhook_url",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "bccc7242-c2dc-5cff-8dc9-867d406c2b98",
+      "name": "teams_webhook_url",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "d4803e05-c19c-59e5-bf86-25cbeb3cd378",
+      "name": "smtp_host",
+      "value": "",
+      "description": ""
+    },
+    {
+      "id": "1cdad1be-f9cc-5881-b605-8829792af6e8",
+      "name": "smtp_port",
+      "value": "587",
+      "description": ""
+    },
+    {
+      "id": "d9cbbb9d-a892-5fc9-9ee6-1fc302b1fcd6",
+      "name": "smtp_user",
+      "value": "",
+      "description": ""
+    },
+    {
+      "id": "05e28404-ed62-555d-a8c4-971d53613c54",
+      "name": "smtp_password",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "4579f275-23c7-5840-9bbe-d43f63a0f58e",
+      "name": "mail_from",
+      "value": "",
+      "description": ""
+    },
+    {
+      "id": "d3a4295a-221c-5ef5-b078-a7aaaa00fedd",
+      "name": "mail_to",
+      "value": "",
+      "description": ""
+    },
+    {
+      "id": "4d74f8ec-af12-5501-accc-f87c61c5fff9",
+      "name": "dashboard_url",
+      "value": "https://SOAR_HOST_ADDRESS:443",
+      "description": ""
+    }
+  ],
+  "execution_variables": [],
+  "tags": [
+    "wazuh",
+    "boilerplate"
+  ],
+  "errors": [],
+  "sharing": "private",
+  "execution_environment": "Shuffle",
+  "configuration": {
+    "exit_on_error": false,
+    "start_from_top": false
+  }
+}

@@ -1,0 +1,146 @@
+# Optional SOAR automation: Shuffle (frontend, backend, orborus + its own OpenSearch).
+#
+# Overlay on top of docker-compose.yml (and docker-compose.soar.yml if used):
+#
+#   docker compose -f docker-compose.yml [-f docker-compose.soar.yml] -f docker-compose.shuffle.yml up -d
+#   (the scripts add it automatically when ENABLE_SHUFFLE_STACK=true)
+#
+# - Shuffle gets its OWN OpenSearch (shuffle-opensearch). It never touches the
+#   Wazuh indexer and it is not published on the host.
+# - The Wazuh manager reaches the webhook at http://shuffle-backend:5001 over
+#   the shared compose network.
+# - Workflow apps run as sibling containers started by orborus. They reach
+#   MISP / TheHive / Cortex / Wazuh API through SOAR_HOST_ADDRESS (the Docker
+#   host's IP), so those services must be published on that address.
+# - SECURITY: backend and orborus mount /var/run/docker.sock (root-equivalent).
+#
+# See docs/05-shuffle.md.
+
+x-shuffle-logging: &shuffle-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  shuffle-opensearch:
+    image: opensearchproject/opensearch:${SHUFFLE_OPENSEARCH_VERSION:-2.14.0}
+    hostname: shuffle-opensearch
+    restart: unless-stopped
+    logging: *shuffle-logging
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms${SHUFFLE_OPENSEARCH_HEAP:-1g} -Xmx${SHUFFLE_OPENSEARCH_HEAP:-1g}"
+      - bootstrap.memory_lock=true
+      - DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI=true
+      - cluster.initial_master_nodes=shuffle-opensearch
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      - cluster.name=shuffle-cluster
+      - node.name=shuffle-opensearch
+      - node.store.allow_mmap=false
+      - discovery.seed_hosts=shuffle-opensearch
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${SHUFFLE_OPENSEARCH_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - shuffle_opensearch:/usr/share/opensearch/data
+    networks:
+      - default
+      - shuffle
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -u \"admin:$$OPENSEARCH_INITIAL_ADMIN_PASSWORD\" https://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:${SHUFFLE_VERSION:-latest}
+    hostname: shuffle-backend
+    restart: unless-stopped
+    logging: *shuffle-logging
+    ports:
+      # Needed by orborus/workers that reach the backend via the host address.
+      - "${SHUFFLE_BACKEND_BIND:-0.0.0.0}:5001:5001"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+      - BACKEND_PORT=5001
+      - ENVIRONMENT_NAME=Shuffle
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - SHUFFLE_OPENSEARCH_URL=https://shuffle-opensearch:9200
+      - SHUFFLE_OPENSEARCH_USERNAME=admin
+      - SHUFFLE_OPENSEARCH_PASSWORD=${SHUFFLE_OPENSEARCH_PASSWORD}
+      - SHUFFLE_OPENSEARCH_SKIPSSL_VERIFY=true
+      - SHUFFLE_ELASTIC=true
+      # First admin account + API key are created at first boot, so the
+      # "first visitor becomes admin" registration page is never exposed.
+      - SHUFFLE_DEFAULT_USERNAME=${SHUFFLE_ADMIN_USERNAME}
+      - SHUFFLE_DEFAULT_PASSWORD=${SHUFFLE_ADMIN_PASSWORD}
+      - SHUFFLE_DEFAULT_APIKEY=${SHUFFLE_ADMIN_APIKEY}
+      # Encrypts stored app authentication (API keys you save in Shuffle).
+      - SHUFFLE_ENCRYPTION_MODIFIER=${SHUFFLE_ENCRYPTION_MODIFIER}
+      - SHUFFLE_APP_DOWNLOAD_LOCATION=https://github.com/shuffle/python-apps
+      - SHUFFLE_DOWNLOAD_AUTH_BRANCH=master
+      - SHUFFLE_APP_FORCE_UPDATE=false
+      - SHUFFLE_CONTAINER_AUTO_CLEANUP=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shuffle_apps:/shuffle-apps
+      - shuffle_files:/shuffle-files
+    networks:
+      - default
+      - shuffle
+    depends_on:
+      shuffle-opensearch:
+        condition: service_healthy
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:${SHUFFLE_VERSION:-latest}
+    hostname: shuffle-frontend
+    restart: unless-stopped
+    logging: *shuffle-logging
+    ports:
+      - "${SHUFFLE_PORT:-3443}:443"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+    networks:
+      - shuffle
+    depends_on:
+      - shuffle-backend
+
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:${SHUFFLE_VERSION:-latest}
+    hostname: shuffle-orborus
+    restart: unless-stopped
+    logging: *shuffle-logging
+    environment:
+      - ENVIRONMENT_NAME=Shuffle
+      - BASE_URL=http://${SOAR_HOST_ADDRESS}:5001
+      - SHUFFLE_APP_SDK_TIMEOUT=300
+      - SHUFFLE_ORBORUS_EXECUTION_CONCURRENCY=${SHUFFLE_CONCURRENCY:-5}
+      - DOCKER_API_VERSION=1.40
+      - SHUFFLE_SWARM_CONFIG=run
+      - SHUFFLE_WORKER_IMAGE=ghcr.io/shuffle/shuffle-worker:${SHUFFLE_VERSION:-latest}
+      - SHUFFLE_STATS_DISABLED=true
+      - SHUFFLE_LOGS_DISABLED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - shuffle
+    depends_on:
+      - shuffle-backend
+
+networks:
+  # Fixed name: workers and app containers spawned by orborus join it.
+  shuffle:
+    name: shuffle_shuffle
+    driver: bridge
+
+volumes:
+  shuffle_opensearch:
+  shuffle_apps:
+  shuffle_files:

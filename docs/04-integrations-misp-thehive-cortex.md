@@ -20,6 +20,10 @@
 | Cortex → MISP | `MISP_2_1` analyzer | Cortex UI |
 | TheHive ↔ MISP | MISP connector: import MISP events as alerts, export cases as events | TheHive UI |
 
+For automation on top of this (playbooks, active response, notifications),
+see [doc 5: Shuffle](05-shuffle.md). Its enrichment workflow reuses the same
+TheHive alert when both paths fire.
+
 You can use the bundled containers (`docker-compose.soar.yml`) or instances you
 already run. For existing instances, skip step 1 and point `MISP_URL` and
 `THEHIVE_URL` at them.
