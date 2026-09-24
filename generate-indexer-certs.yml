@@ -1,0 +1,9 @@
+# One-shot helper that creates the TLS material for indexer, manager (Filebeat) and dashboard.
+#   docker compose -f generate-indexer-certs.yml run --rm generator
+services:
+  generator:
+    image: wazuh/wazuh-certs-generator:${CERTS_GENERATOR_VERSION:-0.0.2}
+    hostname: wazuh-certs-generator
+    volumes:
+      - ./config/wazuh_indexer_ssl_certs/:/certificates/
+      - ./config/certs.yml:/config/certs.yml
