@@ -10,7 +10,7 @@ scripts replace every default password before the stack is used.
 | Item | Minimum |
 |---|---|
 | OS | Linux x86_64 (Ubuntu 22.04/24.04, RHEL 9, ...) |
-| CPU / RAM | 4 vCPU / 8 GB for Wazuh only; 8 vCPU / 16 GB with MISP + TheHive + Cortex |
+| CPU / RAM | 4 vCPU / 8 GB for Wazuh only; 8 vCPU / 16 GB with MISP + TheHive + Cortex; +4 GB for Shuffle |
 | Disk | 50 GB+ SSD (alerts are stored in the indexer) |
 | Software | Docker Engine 24+, Docker Compose v2, `python3`, `curl`, `openssl` |
 | Kernel | `vm.max_map_count >= 262144` |
@@ -25,6 +25,7 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-wazuh.conf
 ```
 docker-compose.yml             Wazuh manager + indexer + dashboard
 docker-compose.soar.yml        optional MISP + TheHive + Cortex overlay
+docker-compose.shuffle.yml     optional Shuffle SOAR overlay
 generate-indexer-certs.yml     one-shot TLS certificate generator
 .env.example                   every tunable and secret (copied to .env)
 config/
@@ -36,6 +37,8 @@ config/
 integrations/
   wazuh/                       custom-misp / custom-thehive scripts
   cortex/application.conf      Cortex configuration
+  shuffle/code/                Shuffle workflow steps (Python)
+  shuffle/workflows/           importable workflows (no secrets)
 scripts/                       setup, passwords, enrollment, integrations
 ```
 
@@ -82,6 +85,8 @@ Log in at `https://<host>` with `admin` and the `INDEXER_ADMIN_PASSWORD` from
    ([doc 2](02-agent-enrollment.md)).
 8. Installs the MISP and TheHive integration scripts and rules
    ([doc 4](04-integrations-misp-thehive-cortex.md)).
+9. If `ENABLE_SHUFFLE_STACK=true`, runs `shuffle-setup.sh`
+   ([doc 5](05-shuffle.md)).
 
 ## Manual steps (what the script automates)
 
@@ -109,7 +114,9 @@ docker compose logs -f wazuh.manager
 | 514/udp | Syslog | Syslog sources only; remove it from the compose file if unused |
 | 55000/tcp | Wazuh API | Admins only; set `API_BIND=127.0.0.1` if nothing external uses it |
 | 9200/tcp | Indexer | Bound to `127.0.0.1` |
-| 8443 / 9000 / 9001 | MISP / TheHive / Cortex | SOC analysts only |
+| 8443 / 9000 / 9001 | MISP / TheHive / Cortex | SOC analysts only (Shuffle apps reach them via `SOAR_HOST_ADDRESS`) |
+| 3443/tcp | Shuffle UI | SOC analysts only |
+| 5001/tcp | Shuffle backend / webhooks | this host and the SOC network only |
 
 Example with `ufw`:
 

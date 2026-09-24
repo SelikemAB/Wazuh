@@ -7,6 +7,7 @@ Sub-commands
   validate                 check every credential in .env against the policy
   render                   render config templates (needs *_HASH env vars)
   api-set-passwords        set the Wazuh API users' passwords from .env
+  api-create-shuffle-user  create the least-privilege API user for Shuffle
 
 Only the Python standard library is used so it runs on any Docker host.
 """
@@ -20,6 +21,7 @@ import string
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from xml.sax.saxutils import escape
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,6 +104,10 @@ def check_password(pw):
     return None
 
 
+def shuffle_host_ok(host):
+    return bool(host) and host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
 def cmd_init_env():
     if os.path.exists(ENV_FILE):
         die(".env already exists - edit it or delete it first")
@@ -111,6 +117,7 @@ def cmd_init_env():
         "__GENERATE_KEY40__": lambda: "".join(
             secrets.choice(string.ascii_letters + string.digits) for _ in range(40)),
         "__GENERATE_SECRET__": lambda: secrets.token_urlsafe(48),
+        "__GENERATE_UUID__": lambda: str(uuid.uuid4()),
     }
     out = []
     with open(ENV_EXAMPLE) as fh:
@@ -158,6 +165,27 @@ def cmd_validate():
                 errors.append(f"{key} must be set when ENABLE_SOAR_STACK=true")
         if not re.fullmatch(r"[A-Za-z0-9]{40}", env.get("MISP_ADMIN_KEY", "")):
             errors.append("MISP_ADMIN_KEY must be 40 alphanumeric characters")
+    if env_bool(env, "ENABLE_SHUFFLE_STACK"):
+        for key in ("SHUFFLE_OPENSEARCH_PASSWORD", "SHUFFLE_ADMIN_PASSWORD"):
+            problem = check_password(env.get(key, "")) if env.get(key) else "is empty"
+            if problem:
+                errors.append(f"{key} {problem}")
+        if not re.fullmatch(r"[0-9a-f-]{36}", env.get("SHUFFLE_ADMIN_APIKEY", "")):
+            errors.append("SHUFFLE_ADMIN_APIKEY must be a UUID")
+        if len(env.get("SHUFFLE_ENCRYPTION_MODIFIER", "")) < 32:
+            errors.append("SHUFFLE_ENCRYPTION_MODIFIER must be at least 32 characters")
+        if not shuffle_host_ok(env.get("SOAR_HOST_ADDRESS", "")):
+            errors.append("SOAR_HOST_ADDRESS must be the Docker host's LAN IP/FQDN (not empty/localhost)")
+    if env_bool(env, "ENABLE_SHUFFLE"):
+        urls = [u for u in env.get("SHUFFLE_WEBHOOK_URLS", "").split(",") if u.strip()]
+        if not urls:
+            errors.append("ENABLE_SHUFFLE=true but SHUFFLE_WEBHOOK_URLS is empty")
+        for u in urls:
+            if not re.match(r"^https?://[^\s]+/api/v1/hooks/webhook_[0-9a-f-]+$", u.strip()):
+                errors.append(f"SHUFFLE_WEBHOOK_URLS entry is not a Shuffle webhook URL: {u}")
+        level = env.get("SHUFFLE_MIN_LEVEL", "")
+        if level and not (level.isdigit() and 0 <= int(level) <= 16):
+            errors.append("SHUFFLE_MIN_LEVEL must be empty or 0-16")
     if errors:
         for e in errors:
             print(f"  - {e}", file=sys.stderr)
@@ -215,6 +243,18 @@ def integration_blocks(env):
     <level>{int(env.get("THEHIVE_MIN_LEVEL", "7"))}</level>
     <alert_format>json</alert_format>
     <options>{escape(opts)}</options>
+  </integration>""")
+    if env_bool(env, "ENABLE_SHUFFLE"):
+        # Built-in Wazuh integration (integrations/shuffle.py): posts every
+        # alert to the webhook. One block per webhook URL.
+        level = env.get("SHUFFLE_MIN_LEVEL", "").strip()
+        level_tag = f"\n    <level>{int(level)}</level>" if level else ""
+        for url in [u.strip() for u in env.get("SHUFFLE_WEBHOOK_URLS", "").split(",") if u.strip()]:
+            blocks.append(f"""  <!-- Shuffle: {"all alerts" if not level else "alerts >= level " + level} -->
+  <integration>
+    <name>shuffle</name>
+    <hook_url>{escape(url)}</hook_url>{level_tag}
+    <alert_format>json</alert_format>
   </integration>""")
     return "\n\n".join(blocks) if blocks else "  <!-- no integrations enabled -->"
 
@@ -330,6 +370,49 @@ def cmd_api_set_passwords():
     print("  verified: both API users authenticate with the new passwords")
 
 
+def cmd_api_create_shuffle_user():
+    """Create/refresh a least-privilege API user that may only run active responses."""
+    env = parse_env()
+    user = env.get("SHUFFLE_WAZUH_API_USER", "shuffle-ar")
+    password = env.get("SHUFFLE_WAZUH_API_PASSWORD", "")
+    problem = check_password(password) if password else "is empty"
+    if problem:
+        die(f"SHUFFLE_WAZUH_API_PASSWORD {problem}")
+    api = WazuhAPI(os.environ.get("WAZUH_API_URL", "https://127.0.0.1:55000"))
+    if not api.login("wazuh", env["API_ADMIN_PASSWORD"]):
+        die("cannot log in as API user 'wazuh' with API_ADMIN_PASSWORD")
+
+    def find(path, key, name):
+        res = api._request("GET", f"{path}?limit=500")
+        for item in res["data"]["affected_items"]:
+            if item.get(key) == name:
+                return item["id"]
+        return None
+
+    policy_name, role_name = "shuffle_active_response", "shuffle_active_response"
+    policy = {"actions": ["active-response:command"], "resources": ["agent:id:*"], "effect": "allow"}
+    pid = find("/security/policies", "name", policy_name)
+    if pid is None:
+        pid = api._request("POST", "/security/policies",
+                           {"name": policy_name, "policy": policy})["data"]["affected_items"][0]["id"]
+    rid = find("/security/roles", "name", role_name)
+    if rid is None:
+        rid = api._request("POST", "/security/roles", {"name": role_name})["data"]["affected_items"][0]["id"]
+    api._request("POST", f"/security/roles/{rid}/policies?policy_ids={pid}")
+    uid = find("/security/users", "username", user)
+    if uid is None:
+        uid = api._request("POST", "/security/users",
+                           {"username": user, "password": password})["data"]["affected_items"][0]["id"]
+        print(f"  created API user '{user}'")
+    else:
+        api._request("PUT", f"/security/users/{uid}", {"password": password})
+        print(f"  API user '{user}' exists - password synced from .env")
+    api._request("POST", f"/security/users/{uid}/roles?role_ids={rid}")
+    if not WazuhAPI(api.url).login(user, password):
+        die(f"verification login failed for '{user}'")
+    print(f"  '{user}' can only run active-response commands (role {role_name})")
+
+
 def main(argv):
     if not argv:
         die(__doc__)
@@ -344,6 +427,8 @@ def main(argv):
         cmd_render()
     elif cmd == "api-set-passwords":
         cmd_api_set_passwords()
+    elif cmd == "api-create-shuffle-user":
+        cmd_api_create_shuffle_user()
     else:
         die(__doc__)
 

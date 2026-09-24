@@ -47,6 +47,9 @@ log "Replacing default Wazuh API passwords"
 ctl api-set-passwords
 "$ROOT/scripts/enable-enrollment.sh"
 "$ROOT/scripts/install-integrations.sh"
+if is_true ENABLE_SHUFFLE_STACK; then
+  "$ROOT/scripts/shuffle-setup.sh"
+fi
 
 ok "Deployment complete"
 cat <<MSG

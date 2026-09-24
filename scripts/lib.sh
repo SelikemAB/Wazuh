@@ -16,10 +16,13 @@ ctl()     { python3 "$ROOT/scripts/wazuhctl.py" "$@"; }
 env_get() { ctl get "$1"; }
 is_true() { [[ "$(env_get "$1" | tr '[:upper:]' '[:lower:]')" =~ ^(1|true|yes|on)$ ]]; }
 
-# docker compose with the SOAR overlay added when ENABLE_SOAR_STACK=true
+# docker compose with the optional overlays added from .env:
+#   ENABLE_SOAR_STACK=true    -> docker-compose.soar.yml    (MISP, TheHive, Cortex)
+#   ENABLE_SHUFFLE_STACK=true -> docker-compose.shuffle.yml (Shuffle)
 dc() {
   local files=(-f "$ROOT/docker-compose.yml")
   if is_true ENABLE_SOAR_STACK; then files+=(-f "$ROOT/docker-compose.soar.yml"); fi
+  if is_true ENABLE_SHUFFLE_STACK; then files+=(-f "$ROOT/docker-compose.shuffle.yml"); fi
   docker compose --env-file "$ROOT/.env" "${files[@]}" "$@"
 }
 
