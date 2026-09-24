@@ -1,0 +1,18 @@
+# Node definitions consumed by wazuh-certs-generator (see generate-indexer-certs.yml).
+# Add extra DNS names / IPs here if the stack will be reached by another name.
+nodes:
+  # Wazuh indexer nodes
+  indexer:
+    - name: wazuh.indexer
+      ip: wazuh.indexer
+
+  # Wazuh server nodes
+  # Use node_type only with more than one Wazuh manager
+  server:
+    - name: wazuh.manager
+      ip: wazuh.manager
+
+  # Wazuh dashboard node
+  dashboard:
+    - name: wazuh.dashboard
+      ip: wazuh.dashboard

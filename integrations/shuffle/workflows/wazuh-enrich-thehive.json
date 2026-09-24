@@ -1,0 +1,341 @@
+{
+  "id": "fb3fe499-8a58-5cb3-ae05-d1a5a849cd54",
+  "name": "Wazuh - Enrich & TheHive case",
+  "description": "Wazuh alert -> MISP lookup -> TheHive alert (+case when severe or MISP hit) -> Cortex analyzers -> case comment.",
+  "is_valid": true,
+  "start": "0de2e099-e449-5408-8370-54125df4b522",
+  "actions": [
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "enrich_extract",
+      "id": "0de2e099-e449-5408-8370-54125df4b522",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": true,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"enrich_extract\": decide whether the alert goes to TheHive, collect observables.\nALERT = load(r\"\"\"$exec.all_fields\"\"\")\nMIN_LEVEL = as_int(cfg(\"$thehive_min_level\", \"10\"), 10)\n\nrule = ALERT.get(\"rule\", {}) or {}\nlevel = as_int(rule.get(\"level\"), 0)\ngroups = rule.get(\"groups\", []) or []\nobs = observables(ALERT)\nproceed = bool(ALERT) and (level >= MIN_LEVEL or \"misp\" in groups)\nemit({\n    \"proceed\": proceed,\n    \"reason\": \"level %s vs threshold %s%s\" % (level, MIN_LEVEL, \", MISP hit\" if \"misp\" in groups else \"\"),\n    \"alert_id\": ALERT.get(\"id\"),\n    \"level\": level,\n    \"observables\": obs,\n    \"iocs\": sorted({o[\"data\"] for o in obs if o[\"ioc\"]})[:25],\n})\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 400,
+        "y": 300
+      }
+    },
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "enrich_misp",
+      "id": "3f822f43-df16-5880-8576-05a13b5ba828",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": false,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"enrich_misp\": look the IoCs up in MISP (one restSearch with OR semantics).\nEXTRACT = load(r\"\"\"$enrich_extract.message\"\"\")\nMISP_URL = cfg(\"$misp_url\").rstrip(\"/\")\nMISP_KEY = cfg(\"$misp_api_key\")\nVERIFY = as_bool(cfg(\"$verify_ssl\", \"false\"))\n\niocs = EXTRACT.get(\"iocs\", [])\nresult = {\"hit_count\": 0, \"hits\": [], \"checked\": len(iocs)}\nif iocs and MISP_URL and MISP_KEY:\n    try:\n        resp = requests.post(\n            MISP_URL + \"/attributes/restSearch\",\n            headers={\"Authorization\": MISP_KEY, \"Accept\": \"application/json\",\n                     \"Content-Type\": \"application/json\"},\n            json={\"returnFormat\": \"json\", \"value\": iocs, \"limit\": 50, \"includeEventTags\": 1},\n            verify=VERIFY, timeout=20)\n        resp.raise_for_status()\n        for attr in resp.json().get(\"response\", {}).get(\"Attribute\", []):\n            event = attr.get(\"Event\", {}) or {}\n            result[\"hits\"].append({\n                \"value\": attr.get(\"value\"),\n                \"type\": attr.get(\"type\"),\n                \"to_ids\": attr.get(\"to_ids\"),\n                \"event_id\": attr.get(\"event_id\"),\n                \"event_info\": event.get(\"info\"),\n                \"tags\": [t.get(\"name\") for t in (attr.get(\"Tag\") or []) if t.get(\"name\")],\n            })\n        result[\"hit_count\"] = len(result[\"hits\"])\n    except Exception as exc:  # keep the chain going; TheHive still gets the alert\n        result[\"error\"] = str(exc)[:300]\nelif not (MISP_URL and MISP_KEY):\n    result[\"error\"] = \"misp_url / misp_api_key workflow variables not set\"\nemit(result)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 720,
+        "y": 300
+      }
+    },
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "enrich_thehive",
+      "id": "576007a7-faba-550d-bb72-7770d0f26696",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": false,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"enrich_thehive\": create the TheHive alert and promote it to a case\n# when it is severe enough or MISP matched. If the direct Wazuh->TheHive\n# integration already created the alert (same type/source/sourceRef), reuse it.\nALERT = load(r\"\"\"$exec.all_fields\"\"\")\nEXTRACT = load(r\"\"\"$enrich_extract.message\"\"\")\nMISP = load(r\"\"\"$enrich_misp.message\"\"\")\nURL = cfg(\"$thehive_url\").rstrip(\"/\")\nKEY = cfg(\"$thehive_api_key\")\nORG = cfg(\"$thehive_organisation\")\nCASE_LEVEL = as_int(cfg(\"$case_min_level\", \"12\"), 12)\nVERIFY = as_bool(cfg(\"$verify_ssl\", \"false\"))\n\nHEADERS = {\"Authorization\": \"Bearer \" + KEY, \"Content-Type\": \"application/json\"}\nif ORG:\n    HEADERS[\"X-Organisation\"] = ORG\n\n\ndef severity(level):\n    return 4 if level >= 13 else 3 if level >= 10 else 2 if level >= 7 else 1\n\n\ndef find_existing(source_ref):\n    query = {\"query\": [{\"_name\": \"listAlert\"},\n                       {\"_name\": \"filter\", \"_and\": [{\"_field\": \"type\", \"_value\": \"wazuh\"},\n                                                    {\"_field\": \"source\", \"_value\": \"wazuh\"},\n                                                    {\"_field\": \"sourceRef\", \"_value\": source_ref}]}]}\n    resp = requests.post(URL + \"/api/v1/query\", headers=HEADERS, json=query, verify=VERIFY, timeout=20)\n    resp.raise_for_status()\n    items = resp.json()\n    return items[0] if items else None\n\n\nrule = ALERT.get(\"rule\", {}) or {}\nagent = ALERT.get(\"agent\", {}) or {}\nlevel = as_int(rule.get(\"level\"), 0)\nhits = MISP.get(\"hits\", [])\nhit_values = {h.get(\"value\") for h in hits}\n\ntags = [\"wazuh\", \"shuffle\", \"rule:%s\" % rule.get(\"id\"), \"level:%s\" % level,\n        \"agent:%s\" % agent.get(\"name\", \"manager\")]\ntags += [\"group:\" + g for g in rule.get(\"groups\", []) or []]\ntags += [\"mitre:\" + t for t in ((rule.get(\"mitre\") or {}).get(\"id\") or [])]\ntags += [\"misp:event-%s\" % h.get(\"event_id\") for h in hits][:10]\n\nobs = []\nfor o in EXTRACT.get(\"observables\", []):\n    item = {\"dataType\": o[\"dataType\"], \"data\": o[\"data\"], \"message\": o[\"message\"]}\n    if o[\"data\"] in hit_values:\n        item[\"ioc\"] = True\n        item[\"tags\"] = [\"misp-hit\"]\n    obs.append(item)\n\nmisp_md = \"\"\nif hits:\n    misp_md = \"\\n\\n**MISP matches:**\\n\" + \"\\n\".join(\n        \"- `%s` (%s) - event %s: %s%s\" % (h[\"value\"], h[\"type\"], h[\"event_id\"], h[\"event_info\"],\n                                          \" **[to_ids]**\" if h.get(\"to_ids\") else \"\")\n        for h in hits[:20])\n\nbody = {\n    \"type\": \"wazuh\",\n    \"source\": \"wazuh\",\n    \"sourceRef\": str(ALERT.get(\"id\")),\n    \"title\": (\"[Wazuh] \" + str(rule.get(\"description\", \"alert\")))[:512],\n    \"description\": \"**Rule:** %s - %s (level %s)\\n**Agent:** %s (%s) %s\\n**Location:** %s\\n**Timestamp:** %s%s\\n\\n```\\n%s\\n```\" % (\n        rule.get(\"id\"), rule.get(\"description\"), level, agent.get(\"name\"), agent.get(\"id\"),\n        agent.get(\"ip\", \"\"), ALERT.get(\"location\"), ALERT.get(\"timestamp\"), misp_md,\n        str(ALERT.get(\"full_log\", \"\"))[:4000]),\n    \"severity\": min(4, severity(level) + (1 if hits else 0)),\n    \"tlp\": 2,\n    \"pap\": 2,\n    \"tags\": tags[:50],\n    \"observables\": obs,\n}\n\nout = {\"alert_id\": None, \"case_id\": None, \"created\": False}\ntry:\n    resp = requests.post(URL + \"/api/v1/alert\", headers=HEADERS, json=body, verify=VERIFY, timeout=20)\n    if resp.status_code in (200, 201):\n        alert = resp.json()\n        out[\"created\"] = True\n    else:\n        alert = find_existing(body[\"sourceRef\"])\n        if not alert:\n            raise RuntimeError(\"HTTP %s: %s\" % (resp.status_code, resp.text[:300]))\n    out[\"alert_id\"] = alert.get(\"_id\")\n    out[\"case_id\"] = alert.get(\"caseId\")\n\n    if not out[\"case_id\"] and (level >= CASE_LEVEL or hits):\n        resp = requests.post(URL + \"/api/v1/alert/%s/case\" % out[\"alert_id\"], headers=HEADERS,\n                             json={}, verify=VERIFY, timeout=20)\n        resp.raise_for_status()\n        out[\"case_id\"] = resp.json().get(\"_id\")\n        out[\"case_number\"] = resp.json().get(\"number\")\nexcept Exception as exc:\n    out[\"error\"] = str(exc)[:500]\nemit(out)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 1040,
+        "y": 300
+      }
+    },
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "app_id": "",
+      "name": "execute_python",
+      "label": "enrich_cortex",
+      "id": "c5d14b99-12c8-5eb5-8657-88688b8157dc",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "isStartNode": false,
+      "errors": [],
+      "authentication_id": "",
+      "sharing": false,
+      "private_id": "",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "# ---------------------------------------------------------------------------\n# Shared helpers, prepended to every step by scripts/shuffle_workflows.py.\n# Each step runs in Shuffle's \"Shuffle Tools > Execute python\" action. Shuffle\n# replaces the dollar-placeholders (workflow variables, the webhook body and\n# earlier step results) in the code before running it; whatever the step\n# prints becomes its result. Never write a literal dollar sign followed by a\n# name anywhere in these files, including comments.\n# ---------------------------------------------------------------------------\nimport ipaddress\nimport json\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\n\ndef load(raw):\n    \"\"\"Parse a substituted JSON placeholder; {} if missing or not substituted.\"\"\"\n    raw = (raw or \"\").strip()\n    if not raw or raw.startswith(chr(36)):\n        return {}\n    try:\n        value = json.loads(raw)\n    except ValueError:\n        return {}\n    # a step result may be a JSON string that itself contains JSON\n    if isinstance(value, str):\n        try:\n            return json.loads(value)\n        except ValueError:\n            return {}\n    return value\n\n\ndef cfg(raw, default=\"\"):\n    \"\"\"Workflow variable, or default if Shuffle left the placeholder untouched.\"\"\"\n    raw = (raw or \"\").strip()\n    return default if not raw or raw.startswith(chr(36)) else raw\n\n\ndef as_int(raw, default=0):\n    try:\n        return int(str(raw).strip())\n    except (TypeError, ValueError):\n        return default\n\n\ndef as_bool(raw, default=False):\n    raw = str(raw).strip().lower()\n    if raw in (\"1\", \"true\", \"yes\", \"on\"):\n        return True\n    if raw in (\"0\", \"false\", \"no\", \"off\"):\n        return False\n    return default\n\n\ndef csv(raw):\n    return [x.strip() for x in str(raw or \"\").split(\",\") if x.strip()]\n\n\ndef is_ip(value):\n    try:\n        ipaddress.ip_address(str(value))\n        return True\n    except ValueError:\n        return False\n\n\ndef is_public_ip(value):\n    try:\n        return ipaddress.ip_address(str(value)).is_global\n    except ValueError:\n        return False\n\n\ndef emit(obj):\n    print(json.dumps(obj))\n\n\ndef observables(alert):\n    \"\"\"Observables for TheHive/Cortex; 'ioc' marks values worth a MISP lookup.\"\"\"\n    obs = []\n\n    def add(data_type, value, message, ioc=False):\n        if value and isinstance(value, str):\n            obs.append({\"dataType\": data_type, \"data\": value.strip(), \"message\": message, \"ioc\": ioc})\n\n    data = alert.get(\"data\", {}) or {}\n    win = (data.get(\"win\", {}) or {}).get(\"eventdata\", {}) or {}\n    agent = alert.get(\"agent\", {}) or {}\n\n    add(\"hostname\", agent.get(\"name\"), \"Wazuh agent\")\n    if is_ip(agent.get(\"ip\", \"\")):\n        add(\"ip\", agent[\"ip\"], \"Wazuh agent IP\")\n    for key in (\"srcip\", \"dstip\"):\n        if is_ip(data.get(key, \"\")):\n            add(\"ip\", data[key], \"data.\" + key, ioc=is_public_ip(data[key]))\n    for key in (\"srcuser\", \"dstuser\"):\n        add(\"other\", data.get(key), \"user (\" + key + \")\")\n    for key in (\"sourceIp\", \"destinationIp\"):\n        if is_ip(win.get(key, \"\")):\n            add(\"ip\", win[key], \"sysmon \" + key, ioc=is_public_ip(win[key]))\n    if win.get(\"queryName\"):\n        add(\"domain\", win[\"queryName\"].rstrip(\".\").lower(), \"sysmon DNS query\", ioc=True)\n    if win.get(\"image\"):\n        add(\"filename\", win[\"image\"], \"sysmon image\")\n    for part in str(win.get(\"hashes\") or win.get(\"hash\") or \"\").split(\",\"):\n        if \"=\" in part:\n            algo, _, value = part.partition(\"=\")\n            if algo.strip().upper() in (\"MD5\", \"SHA1\", \"SHA256\"):\n                add(\"hash\", value.strip().lower(), \"sysmon \" + algo.strip(), ioc=True)\n    sc = alert.get(\"syscheck\", {}) or {}\n    if sc.get(\"path\"):\n        add(\"filename\", sc[\"path\"], \"FIM path\")\n    for algo in (\"md5_after\", \"sha1_after\", \"sha256_after\"):\n        add(\"hash\", (sc.get(algo) or \"\").lower(), \"FIM \" + algo, ioc=True)\n    misp = data.get(\"misp\", {}) or {}\n    if str(misp.get(\"found\")) == \"1\" and misp.get(\"value\"):\n        dt = \"ip\" if is_ip(misp[\"value\"]) else \"hash\" if misp.get(\"ioc_type\") in (\"md5\", \"sha1\", \"sha256\") else \"domain\"\n        add(dt, misp[\"value\"], \"MISP hit (event \" + str(misp.get(\"event_id\")) + \")\", ioc=True)\n\n    unique, seen = [], set()\n    for o in obs:\n        key = (o[\"dataType\"], o[\"data\"])\n        if key not in seen:\n            seen.add(key)\n            unique.append(o)\n    return unique\n\n\n# Step \"enrich_cortex\": run the configured Cortex analyzers on the IoC\n# observables, wait for the reports and post a summary as a case comment.\nEXTRACT = load(r\"\"\"$enrich_extract.message\"\"\")\nHIVE = load(r\"\"\"$enrich_thehive.message\"\"\")\nCORTEX_URL = cfg(\"$cortex_url\").rstrip(\"/\")\nCORTEX_KEY = cfg(\"$cortex_api_key\")\nANALYZERS = csv(cfg(\"$cortex_analyzers\", \"MISP_2_1\"))\nHIVE_URL = cfg(\"$thehive_url\").rstrip(\"/\")\nHIVE_KEY = cfg(\"$thehive_api_key\")\nORG = cfg(\"$thehive_organisation\")\nVERIFY = as_bool(cfg(\"$verify_ssl\", \"false\"))\nMAX_JOBS = 10\n\nC_HEADERS = {\"Authorization\": \"Bearer \" + CORTEX_KEY, \"Content-Type\": \"application/json\"}\nH_HEADERS = {\"Authorization\": \"Bearer \" + HIVE_KEY, \"Content-Type\": \"application/json\"}\nif ORG:\n    H_HEADERS[\"X-Organisation\"] = ORG\n\nout = {\"jobs\": [], \"commented\": False}\nif not (CORTEX_URL and CORTEX_KEY):\n    out[\"error\"] = \"cortex_url / cortex_api_key workflow variables not set\"\n    emit(out)\n    raise SystemExit(0)\n\nby_type = {}\njobs = []\nfor o in [o for o in EXTRACT.get(\"observables\", []) if o.get(\"ioc\")]:\n    dt = o[\"dataType\"]\n    if dt not in by_type:\n        r = requests.get(CORTEX_URL + \"/api/analyzer/type/\" + dt, headers=C_HEADERS, verify=VERIFY, timeout=20)\n        by_type[dt] = [a for a in (r.json() if r.ok else []) if a.get(\"name\") in ANALYZERS]\n    for analyzer in by_type[dt]:\n        if len(jobs) >= MAX_JOBS:\n            break\n        r = requests.post(CORTEX_URL + \"/api/analyzer/%s/run\" % analyzer[\"id\"], headers=C_HEADERS,\n                          json={\"data\": o[\"data\"], \"dataType\": dt, \"tlp\": 2,\n                                \"message\": \"Shuffle - Wazuh alert %s\" % EXTRACT.get(\"alert_id\")},\n                          verify=VERIFY, timeout=20)\n        if r.ok:\n            jobs.append((analyzer[\"name\"], o[\"data\"], r.json().get(\"id\")))\n\nlines = []\nfor name, data, job_id in jobs:\n    entry = {\"analyzer\": name, \"data\": data, \"job_id\": job_id, \"status\": \"Unknown\", \"taxonomies\": []}\n    try:\n        r = requests.get(CORTEX_URL + \"/api/job/%s/waitreport?atMost=1minute\" % job_id,\n                         headers=C_HEADERS, verify=VERIFY, timeout=90)\n        job = r.json()\n        entry[\"status\"] = job.get(\"status\")\n        taxonomies = ((job.get(\"report\") or {}).get(\"summary\") or {}).get(\"taxonomies\", [])\n        entry[\"taxonomies\"] = [\"%s:%s=%s (%s)\" % (t.get(\"namespace\"), t.get(\"predicate\"), t.get(\"value\"), t.get(\"level\"))\n                               for t in taxonomies]\n    except Exception as exc:\n        entry[\"error\"] = str(exc)[:200]\n    out[\"jobs\"].append(entry)\n    lines.append(\"| %s | `%s` | %s | %s |\" % (name, data, entry[\"status\"], \"<br>\".join(entry[\"taxonomies\"]) or \"-\"))\n\nif HIVE.get(\"case_id\") and lines and HIVE_URL and HIVE_KEY:\n    message = \"### Cortex analysis (Shuffle)\\n\\n| Analyzer | Observable | Status | Result |\\n|---|---|---|---|\\n\" + \"\\n\".join(lines)\n    r = requests.post(HIVE_URL + \"/api/v1/case/%s/comment\" % HIVE[\"case_id\"], headers=H_HEADERS,\n                      json={\"message\": message}, verify=VERIFY, timeout=20)\n    out[\"commented\"] = r.ok\nemit(out)\n",
+          "multiline": true,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ],
+      "position": {
+        "x": 1360,
+        "y": 300
+      }
+    }
+  ],
+  "branches": [
+    {
+      "id": "330c63db-2cd4-59d8-bec1-b327066e1420",
+      "source_id": "740af714-1908-5ddb-8f2d-01695b69445f",
+      "destination_id": "0de2e099-e449-5408-8370-54125df4b522",
+      "conditions": [],
+      "label": "",
+      "has_errors": false
+    },
+    {
+      "id": "88d7f520-7f45-586f-954f-0f349356938c",
+      "source_id": "0de2e099-e449-5408-8370-54125df4b522",
+      "destination_id": "3f822f43-df16-5880-8576-05a13b5ba828",
+      "conditions": [
+        {
+          "condition": {
+            "name": "condition",
+            "value": "equals",
+            "id": "c6c5892d-3609-5ceb-8290-39ab1fd51fcd"
+          },
+          "source": {
+            "name": "source",
+            "value": "$enrich_extract.message.proceed",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "e673d311-6ca7-524e-b6a5-2cc71349d9eb"
+          },
+          "destination": {
+            "name": "destination",
+            "value": "true",
+            "variant": "STATIC_VALUE",
+            "action_field": "",
+            "id": "00915b91-583b-5a53-8230-8a80e5c02723"
+          }
+        }
+      ],
+      "label": "",
+      "has_errors": false
+    },
+    {
+      "id": "0be37140-58d4-55e8-9b9c-b67d6b985520",
+      "source_id": "3f822f43-df16-5880-8576-05a13b5ba828",
+      "destination_id": "576007a7-faba-550d-bb72-7770d0f26696",
+      "conditions": [],
+      "label": "",
+      "has_errors": false
+    },
+    {
+      "id": "06894470-9a29-5b49-b77a-b7abb7566d11",
+      "source_id": "576007a7-faba-550d-bb72-7770d0f26696",
+      "destination_id": "c5d14b99-12c8-5eb5-8657-88688b8157dc",
+      "conditions": [],
+      "label": "",
+      "has_errors": false
+    }
+  ],
+  "triggers": [
+    {
+      "app_name": "Webhook",
+      "app_version": "1.0.0",
+      "name": "Webhook",
+      "label": "wazuh_alerts",
+      "description": "Receives Wazuh alerts from the built-in shuffle integration",
+      "id": "740af714-1908-5ddb-8f2d-01695b69445f",
+      "trigger_type": "WEBHOOK",
+      "status": "uninitialized",
+      "environment": "Shuffle",
+      "is_valid": true,
+      "errors": [],
+      "large_image": "",
+      "position": {
+        "x": 100,
+        "y": 300
+      },
+      "parameters": [
+        {
+          "name": "url",
+          "value": "http://shuffle-backend:5001/api/v1/hooks/webhook_740af714-1908-5ddb-8f2d-01695b69445f",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "tmp",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "auth_headers",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "custom_response_body",
+          "value": "",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        },
+        {
+          "name": "await_response",
+          "value": "v1",
+          "multiline": false,
+          "required": true,
+          "variant": "STATIC_VALUE",
+          "action_field": "",
+          "id": "",
+          "description": ""
+        }
+      ]
+    }
+  ],
+  "workflow_variables": [
+    {
+      "id": "125c6a68-3305-51c5-8378-b782977fbb41",
+      "name": "thehive_min_level",
+      "value": "10",
+      "description": ""
+    },
+    {
+      "id": "468b0aff-494f-56de-a360-c4ec10403917",
+      "name": "misp_url",
+      "value": "https://SOAR_HOST_ADDRESS:8443",
+      "description": ""
+    },
+    {
+      "id": "b3f7e506-c470-5e42-bec0-0e2a4c55b27e",
+      "name": "misp_api_key",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "201df2dd-39f2-5df3-a3f2-b73d89a0acce",
+      "name": "verify_ssl",
+      "value": "false",
+      "description": ""
+    },
+    {
+      "id": "38e630fe-2d6c-581e-871b-e783066df502",
+      "name": "thehive_url",
+      "value": "http://SOAR_HOST_ADDRESS:9000",
+      "description": ""
+    },
+    {
+      "id": "424a4ee0-4515-5253-bd4b-cfa6f6ebb0c7",
+      "name": "thehive_api_key",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "ff90f950-5670-50aa-9b16-165a8aed8459",
+      "name": "thehive_organisation",
+      "value": "",
+      "description": ""
+    },
+    {
+      "id": "6a1c49ad-410c-55d3-a73a-2bb6b721ab70",
+      "name": "case_min_level",
+      "value": "12",
+      "description": ""
+    },
+    {
+      "id": "a099d1c6-62a2-5ef9-8518-50ef6f5b0aa5",
+      "name": "cortex_url",
+      "value": "http://SOAR_HOST_ADDRESS:9001",
+      "description": ""
+    },
+    {
+      "id": "17153367-f1b9-5aac-87c7-eed381ff48b3",
+      "name": "cortex_api_key",
+      "value": "",
+      "description": "secret - fill in after import"
+    },
+    {
+      "id": "47c46b6e-9282-5b50-b19d-fc4570194e4f",
+      "name": "cortex_analyzers",
+      "value": "MISP_2_1,AbuseIPDB_1_0",
+      "description": ""
+    }
+  ],
+  "execution_variables": [],
+  "tags": [
+    "wazuh",
+    "boilerplate"
+  ],
+  "errors": [],
+  "sharing": "private",
+  "execution_environment": "Shuffle",
+  "configuration": {
+    "exit_on_error": false,
+    "start_from_top": false
+  }
+}

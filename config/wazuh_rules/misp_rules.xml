@@ -1,0 +1,56 @@
+<!--
+  MISP enrichment rules (events produced by integrations/wazuh/custom-misp.py).
+  Custom rule IDs 100620-100629. Installed by scripts/install-integrations.sh
+  to /var/ossec/etc/rules/misp_rules.xml.
+-->
+<group name="misp,threat_intel,">
+
+  <!-- Base: any event emitted by the MISP integration -->
+  <rule id="100620" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="integration">^misp$</field>
+    <description>MISP integration event</description>
+    <options>no_full_log</options>
+  </rule>
+
+  <rule id="100621" level="5">
+    <if_sid>100620</if_sid>
+    <field name="misp.error">\.+</field>
+    <description>MISP: lookup failed - $(misp.error)</description>
+    <options>no_full_log</options>
+    <group>misp_error,</group>
+  </rule>
+
+  <rule id="100622" level="12">
+    <if_sid>100620</if_sid>
+    <field name="misp.found">^1$</field>
+    <description>MISP: IoC $(misp.value) ($(misp.type)) found in event $(misp.event_id) "$(misp.event_info)" - source rule $(source.rule)</description>
+    <options>no_full_log</options>
+    <group>misp_alert,</group>
+    <mitre>
+      <id>T1071</id>
+    </mitre>
+  </rule>
+
+  <!-- IoC flagged "for IDS" in MISP: high-confidence detection -->
+  <rule id="100623" level="13">
+    <if_sid>100622</if_sid>
+    <field name="misp.to_ids">^true$</field>
+    <description>MISP: high-confidence (to_ids) IoC $(misp.value) found in event $(misp.event_id) "$(misp.event_info)"</description>
+    <options>no_full_log</options>
+    <group>misp_alert,misp_ids,</group>
+  </rule>
+
+  <!-- Hash hit on a process / file: likely malware execution or drop -->
+  <rule id="100624" level="14">
+    <if_sid>100623</if_sid>
+    <field name="misp.ioc_type">^md5$|^sha1$|^sha256$</field>
+    <description>MISP: known-malicious file hash $(misp.value) observed ("$(misp.event_info)")</description>
+    <options>no_full_log</options>
+    <group>misp_alert,misp_ids,malware,</group>
+    <mitre>
+      <id>T1204</id>
+    </mitre>
+  </rule>
+
+</group>
