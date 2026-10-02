@@ -33,7 +33,9 @@ config/
   wazuh_cluster/*.conf.tpl     manager ossec.conf template (auth, integrations)
   wazuh_indexer/               opensearch.yml + internal_users.yml template
   wazuh_dashboard/             dashboard config + wazuh.yml template
-  wazuh_rules/misp_rules.xml   MISP rules (100620-100624)
+custom/
+  rules/                       custom Wazuh rules (incl. MISP rules 100620-100624)
+  decoders/                    custom Wazuh decoders
 integrations/
   wazuh/                       custom-misp / custom-thehive scripts
   cortex/application.conf      Cortex configuration

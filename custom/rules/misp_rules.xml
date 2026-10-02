@@ -1,6 +1,7 @@
 <!--
   MISP enrichment rules (events produced by integrations/wazuh/custom-misp.py).
-  Custom rule IDs 100620-100629. Installed by scripts/install-integrations.sh
+  Custom rule IDs 100620-100629 (see custom/README.md for the ID map).
+  Installed by scripts/install-integrations.sh
   to /var/ossec/etc/rules/misp_rules.xml.
 -->
 <group name="misp,threat_intel,">
