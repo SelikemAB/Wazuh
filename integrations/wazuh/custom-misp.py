@@ -9,7 +9,7 @@ the `custom-misp` <integration> block:
 Indicators (hashes, public IPs, domains) are extracted from the alert and
 looked up with MISP's /attributes/restSearch. Each hit is written back to the
 Wazuh analysis queue as a JSON event with "integration": "misp", which the
-rules in config/wazuh_rules/misp_rules.xml turn into alerts (100620-100629).
+rules in custom/rules/misp_rules.xml turn into alerts (100620-100629).
 """
 import ipaddress
 import json

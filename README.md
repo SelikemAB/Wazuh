@@ -46,7 +46,7 @@ Dashboard: `https://<host>` · user `admin` · password `INDEXER_ADMIN_PASSWORD`
 | `scripts/change-passwords.sh [indexer\|api\|all]` | change or rotate passwords on a running stack |
 | `scripts/enable-enrollment.sh` | install or rotate the enrollment key (and agent CA / manager cert) |
 | `scripts/generate-agent-certs.sh` | agent CA, manager cert and per-agent client certs |
-| `scripts/install-integrations.sh` | install the MISP/TheHive scripts and MISP rules in the manager |
+| `scripts/install-integrations.sh` | install the MISP/TheHive scripts and the custom rules/decoders in `custom/` (validated, rolled back on error) |
 | `scripts/shuffle-setup.sh` | start Shuffle, create the `shuffle-ar` API user, import workflows, wire the webhooks |
 | `scripts/shuffle_workflows.py` | build/import the Shuffle workflows from `integrations/shuffle/code/` |
 | `scripts/wazuhctl.py` | helper: `.env` parsing, policy check, template rendering, API user management |

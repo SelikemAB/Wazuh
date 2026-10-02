@@ -55,11 +55,12 @@ services:
       - ./config/wazuh_indexer_ssl_certs/wazuh.manager.pem:/etc/ssl/filebeat.pem:ro
       - ./config/wazuh_indexer_ssl_certs/wazuh.manager-key.pem:/etc/ssl/filebeat.key:ro
       - ./config/wazuh_cluster/wazuh_manager.conf:/wazuh-config-mount/etc/ossec.conf
-      # Staging area for enrollment secret, custom rules and integration scripts.
+      # Staging area for enrollment secret, custom rules/decoders and integration scripts.
       # scripts/enable-enrollment.sh and scripts/install-integrations.sh copy
       # them into place with the right owner/permissions.
       - ./secrets:/opt/staging/secrets:ro
-      - ./config/wazuh_rules:/opt/staging/rules:ro
+      - ./custom/rules:/opt/staging/rules:ro
+      - ./custom/decoders:/opt/staging/decoders:ro
       - ./integrations/wazuh:/opt/staging/integrations:ro
       - ./config/agent_ssl_certs:/opt/staging/agent_ssl_certs:ro
 
