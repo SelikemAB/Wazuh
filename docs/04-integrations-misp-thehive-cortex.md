@@ -14,7 +14,7 @@
 
 | Direction | How | Where |
 |---|---|---|
-| Wazuh → MISP | `custom-misp` integration looks up hashes, IPs and domains from each alert with `/attributes/restSearch` and writes hits back as events | `integrations/wazuh/custom-misp.py`, `config/wazuh_rules/misp_rules.xml` |
+| Wazuh → MISP | `custom-misp` integration looks up hashes, IPs and domains from each alert with `/attributes/restSearch` and writes hits back as events | `integrations/wazuh/custom-misp.py`, `custom/rules/misp_rules.xml` |
 | Wazuh → TheHive | `custom-thehive` integration creates a TheHive alert (with observables) for every alert at or above `THEHIVE_MIN_LEVEL` | `integrations/wazuh/custom-thehive.py` |
 | TheHive → Cortex | Cortex connector in TheHive runs analyzers on the observables | TheHive UI |
 | Cortex → MISP | `MISP_2_1` analyzer | Cortex UI |
@@ -91,7 +91,7 @@ Cassandra bootstraps. Services:
 | Sysmon 22 `queryName` | domain |
 | FIM `sha256_after` | SHA256 |
 
-**Resulting alerts** (`config/wazuh_rules/misp_rules.xml`):
+**Resulting alerts** (`custom/rules/misp_rules.xml`):
 
 | Rule | Level | Meaning |
 |---|---|---|
