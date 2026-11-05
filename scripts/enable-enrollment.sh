@@ -36,9 +36,18 @@ mgr grep -q '<use_password>yes</use_password>' /var/ossec/etc/ossec.conf \
   || die "use_password is not enabled - re-render configs (scripts/setup.sh) and restart"
 
 log "Restarting Wazuh manager"
+# Only lines written after this point count, so a message from an earlier
+# start can't be mistaken for this one.
+start_line="$(mgr bash -c 'wc -l < /var/ossec/logs/ossec.log' | tr -d '[:space:]')"
 mgr /var/ossec/bin/wazuh-control restart >/dev/null
-sleep 10
-if mgr bash -c 'tail -n 400 /var/ossec/logs/ossec.log | grep -q "authd.*Using password specified on file"'; then
+confirmed=false
+for _ in $(seq 1 15); do
+  if mgr bash -c "tail -n +$((start_line + 1)) /var/ossec/logs/ossec.log | grep -q 'authd.*Using password specified on file'"; then
+    confirmed=true; break
+  fi
+  sleep 2
+done
+if $confirmed; then
   ok "wazuh-authd is enforcing the enrollment key (port 1515)"
 else
   warn "Could not confirm from ossec.log; check: docker compose exec wazuh.manager grep authd /var/ossec/logs/ossec.log"

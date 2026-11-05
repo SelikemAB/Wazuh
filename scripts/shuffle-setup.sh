@@ -48,8 +48,12 @@ python3 "$ROOT/scripts/shuffle_workflows.py" import --write-env
 log "Rendering ossec.conf with the Shuffle integration and restarting the manager"
 ctl validate
 render_configs
-dc restart wazuh.manager
-wait_for_api
+if [[ -n "$(dc ps -q --status running wazuh.manager 2>/dev/null || true)" ]]; then
+  dc restart wazuh.manager
+  wait_for_api
+else
+  warn "wazuh.manager is not running - configs rendered; run scripts/setup.sh to start it"
+fi
 
 ok "Shuffle is wired to Wazuh"
 cat <<MSG
