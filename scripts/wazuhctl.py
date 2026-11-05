@@ -147,8 +147,13 @@ def cmd_validate():
         problem = check_password(value) if value else "is empty"
         if problem:
             errors.append(f"{key} {problem}")
-    if len(set(env.get(k) for k in POLICY_PASSWORDS)) != len(POLICY_PASSWORDS):
-        errors.append("every password in POLICY_PASSWORDS must be unique")
+    secret_keys = list(POLICY_PASSWORDS)
+    if env_bool(env, "ENABLE_SHUFFLE_STACK"):
+        secret_keys += ["SHUFFLE_OPENSEARCH_PASSWORD", "SHUFFLE_ADMIN_PASSWORD"]
+    if env.get("SHUFFLE_WAZUH_API_PASSWORD"):
+        secret_keys.append("SHUFFLE_WAZUH_API_PASSWORD")
+    if len(set(env.get(k) for k in secret_keys)) != len(secret_keys):
+        errors.append("every password (indexer, API, enrollment, Shuffle) must be unique")
     if env.get("API_WUI_USERNAME", "wazuh-wui") == "wazuh":
         errors.append("API_WUI_USERNAME must not be the 'wazuh' admin user")
     if not re.fullmatch(r"[0-9a-f]{32}", env.get("WAZUH_CLUSTER_KEY", "")):
@@ -309,8 +314,16 @@ class WazuhAPI:
             req.add_header("Authorization", f"Bearer {self.token}")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
-        with urllib.request.urlopen(req, context=self.ctx, timeout=30) as resp:
-            return json.loads(resp.read() or b"{}")
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=30) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and path == "/security/user/authenticate":
+                raise  # login() turns this into False
+            detail = exc.read()[:300].decode(errors="replace")
+            die(f"Wazuh API {method} {path}: HTTP {exc.code} {detail}")
+        except urllib.error.URLError as exc:
+            die(f"Wazuh API {method} {path}: {exc.reason}")
 
     def login(self, user, password):
         basic = base64.b64encode(f"{user}:{password}".encode()).decode()

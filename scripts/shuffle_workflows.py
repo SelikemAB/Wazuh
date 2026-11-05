@@ -239,7 +239,10 @@ def update_env(key, value):
 
 def cmd_import(env, write_env):
     api = Shuffle(os.environ.get("SHUFFLE_API_URL", "http://127.0.0.1:5001"), env["SHUFFLE_ADMIN_APIKEY"])
-    existing = {w.get("name"): w.get("id") for w in api.call("GET", "/api/v1/workflows") or []}
+    listing = api.call("GET", "/api/v1/workflows")
+    if not isinstance(listing, list):
+        wazuhctl.die(f"unexpected reply from Shuffle when listing workflows: {str(listing)[:200]}")
+    existing = {w.get("name"): w.get("id") for w in listing}
     hook_urls, manual = [], []
     for wf in WORKFLOWS:
         body = build(wf, env, fill_secrets=True)
@@ -248,6 +251,8 @@ def cmd_import(env, write_env):
             created = api.call("POST", "/api/v1/workflows",
                                {"name": body["name"], "description": body["description"]})
             wf_id = created.get("id")
+            if not wf_id:
+                wazuhctl.die(f"Shuffle did not return an id when creating '{body['name']}': {str(created)[:200]}")
         body["id"] = wf_id
         api.call("PUT", f"/api/v1/workflows/{wf_id}", body)
         trigger = body["triggers"][0]
