@@ -36,7 +36,7 @@ indexer_hash() {
   PW="$1" docker run --rm -e PW --entrypoint /bin/bash "wazuh/wazuh-indexer:${version}" -c \
     'export JAVA_HOME=/usr/share/wazuh-indexer/jdk;
      bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$PW"' \
-    2>/dev/null | grep -E '^\$2[aby]\$' | tail -n1
+    2>/dev/null | { grep -E '^\$2[aby]\$' || true; } | tail -n1
 }
 
 render_configs() {
