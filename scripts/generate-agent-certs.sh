@@ -48,7 +48,7 @@ if [[ "$1" == "--manager" ]]; then
 fi
 
 for name in "$@"; do
-  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid agent name: $name"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid agent name: $name (letters, digits, . _ -; must start with a letter or digit)"
   out="$DIR/agents/$name"; mkdir -p "$out"
   ( umask 077; openssl genrsa -out "$out/sslagent.key" 2048 2>/dev/null )
   openssl req -new -key "$out/sslagent.key" -subj "/C=US/O=Wazuh/OU=Agents/CN=$name" -out "$out/sslagent.csr"

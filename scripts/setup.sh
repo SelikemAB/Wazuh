@@ -25,7 +25,8 @@ mkdir -p "$ROOT/secrets" "$ROOT/config/agent_ssl_certs"; chmod 700 "$ROOT/secret
 ( umask 077; printf '%s\n' "$(env_get ENROLLMENT_PASSWORD)" > "$ROOT/secrets/authd.pass" )
 "$ROOT/scripts/generate-certs.sh"
 conf="$ROOT/config/wazuh_cluster/wazuh_manager.conf"
-before="$(cat "$conf" "$ROOT/config/wazuh_dashboard/wazuh.yml" 2>/dev/null | sha256sum)"
+# Rendered files don't exist on a first run; tolerate that under pipefail.
+before="$({ cat "$conf" "$ROOT/config/wazuh_dashboard/wazuh.yml" 2>/dev/null || true; } | sha256sum)"
 render_configs
 after="$(cat "$conf" "$ROOT/config/wazuh_dashboard/wazuh.yml" | sha256sum)"
 
