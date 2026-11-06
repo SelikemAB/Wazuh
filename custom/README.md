@@ -21,7 +21,8 @@ IDs never collide:
 |---|---|---|
 | 100620–100629 | `rules/misp_rules.xml` | MISP IoC matches (`custom-misp` integration) |
 | 100100–100199 | *(free)* | |
-| 100200–100299 | *(free)* | |
+| 100200–100219 | `rules/sshd_alpine_bypass_rules.xml` | OpenSSH long-password auth bypass on Alpine |
+| 100220–100299 | *(free)* | |
 
 Add a row when you add a file.
 

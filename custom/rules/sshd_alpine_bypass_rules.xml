@@ -1,0 +1,67 @@
+<!--
+  Detection for the OpenSSH long-password authentication bypass on musl/Alpine
+  (password over 256 bytes makes crypt() fail; the failed result matches the
+  "*" hash of a locked account, so sshd accepts it). Fixed in OpenSSH 10.6p2
+  per the report this was written from; confirm against the official advisory.
+
+  sshd does not log password length, so there is no log line that says "long
+  password". These rules detect the symptoms instead:
+    - a password login for an account that should be key-only (root)
+    - repeated password logins for it in a short window (the bypass works on
+      every attempt)
+    - a vulnerable openssh-server package reported by a command check
+
+  Custom rule IDs 100200-100219 (see custom/README.md for the ID map).
+  Installed by scripts/install-integrations.sh to
+  /var/ossec/etc/rules/sshd_alpine_bypass_rules.xml.
+
+  Agent-side command check for rule 100210 (add to the agent ossec.conf):
+    <localfile>
+      <log_format>full_command</log_format>
+      <command>apk info -v openssh-server</command>
+      <alias>apk_openssh_version</alias>
+      <frequency>3600</frequency>
+    </localfile>
+-->
+<group name="sshd,alpine,authentication_bypass,">
+
+  <!-- Password login as root. Root should be key-only; on an exposed host
+       this is either misconfiguration or the bypass. Child of stock 5715
+       (sshd: authentication success). -->
+  <rule id="100200" level="10">
+    <if_sid>5715</if_sid>
+    <match>Accepted password for root</match>
+    <description>sshd: password login as root from $(srcip). Root should be key-only; possible long-password bypass.</description>
+    <mitre>
+      <id>T1078</id>
+      <id>T1021.004</id>
+    </mitre>
+    <group>authentication_success,pci_dss_10.2.4,gdpr_IV_32.2,</group>
+  </rule>
+
+  <!-- The bypass succeeds every time, so an attacker tends to log in repeatedly. -->
+  <rule id="100201" level="13" frequency="3" timeframe="60">
+    <if_matched_sid>100200</if_matched_sid>
+    <same_srcip />
+    <description>sshd: 3 or more root password logins from $(srcip) within 60s. Likely long-password authentication bypass.</description>
+    <mitre>
+      <id>T1078</id>
+      <id>T1190</id>
+    </mitre>
+    <group>attack,</group>
+  </rule>
+
+  <!-- Package version check output, e.g. "openssh-server-10.0_p1-r9".
+       Flags anything below 10.6_p2 (also 9.x and older). -->
+  <rule id="100210" level="9">
+    <location>apk_openssh_version</location>
+    <regex type="pcre2">openssh-server-(?:[0-9]|10\.[0-5])[._]|openssh-server-10\.6_p1</regex>
+    <description>Alpine: openssh-server below 10.6p2 installed. Vulnerable to the long-password bypass; run apk upgrade and restart sshd.</description>
+    <options>no_full_log</options>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>vulnerability,</group>
+  </rule>
+
+</group>
